@@ -1,0 +1,2 @@
+# lappie
+RAG from scratch 
