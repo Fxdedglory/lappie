@@ -1,9 +1,9 @@
 """
 api_main.py
-FastAPI wrapper around your existing RAG setup.
+FastAPI wrapper around your existing RAG setup + chat history.
 
-Version: v0.1.0 (2025-11-17)
-echo: api_main.py v0.1.0 2025-11-17
+Version: v0.2.0 (2025-11-17)
+echo: api_main.py v0.2.0 2025-11-17
 """
 
 import os
@@ -13,31 +13,35 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
-import psycopg2
 
-# Load .env from the same directory if present
+import psycopg2
+from psycopg2.extras import Json
+import uuid
+
+# -------------------------------------------------------------------
+# Load .env from this directory
+# -------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(BASE_DIR, ".env")
 if os.path.exists(env_path):
     load_dotenv(env_path)
 else:
-    # Fallback to process env (e.g. from your version_2 env)
     load_dotenv()
 
-# Ollama / OpenAI-compatible client config
+# -------------------------------------------------------------------
+# Ollama config
+# -------------------------------------------------------------------
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "ollama")
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "gemma3:4b")
 
-client = OpenAI(
-    base_url=OLLAMA_BASE_URL,
-    api_key=OLLAMA_API_KEY,
-)
+client = OpenAI(base_url=OLLAMA_BASE_URL, api_key=OLLAMA_API_KEY)
 
-
+# -------------------------------------------------------------------
+# Postgres connection
+# -------------------------------------------------------------------
 def get_pg_connection():
-    """Create a psycopg2 connection using chat_ingest settings."""
     return psycopg2.connect(
         host=os.getenv("PGHOST", "localhost"),
         port=os.getenv("PGPORT", "5433"),
@@ -46,9 +50,65 @@ def get_pg_connection():
         password=os.getenv("PGPASSWORD", "postgres"),
     )
 
+# -------------------------------------------------------------------
+# Chat History Helpers
+# -------------------------------------------------------------------
+def create_session() -> str:
+    """Create a new chat session in chat_history.sessions."""
+    session_id = str(uuid.uuid4())
 
+    conn = get_pg_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO chat_history.sessions (session_id)
+        VALUES (%s)
+        """,
+        (session_id,),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return session_id
+
+
+def insert_message(
+    session_id: str,
+    role: str,
+    content: str,
+    model_name: Optional[str] = None,
+    token_count: Optional[int] = None,
+    metadata=None,
+):
+    """Insert chat messages into chat_history.messages."""
+    conn = get_pg_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO chat_history.messages
+            (session_id, role, content, model_name, token_count, metadata)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (
+            session_id,
+            role,
+            content,
+            model_name,
+            token_count,
+            Json(metadata) if metadata else Json({}),
+        ),
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# -------------------------------------------------------------------
+# RAG Functions
+# -------------------------------------------------------------------
 def get_latest_doc_id(conn, source_name: str) -> str:
-    """Return the latest doc_id for a given source_name from bronze.web_docs."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -69,7 +129,6 @@ def get_latest_doc_id(conn, source_name: str) -> str:
 
 
 def embed_question(question: str) -> str:
-    """Return a pgvector literal string for the question embedding."""
     resp = client.embeddings.create(
         model=OLLAMA_EMBED_MODEL,
         input=question,
@@ -84,7 +143,6 @@ def search_chunks(
     query_vector_literal: str,
     top_k: int = 5,
 ) -> List[Tuple[str, dict, float]]:
-    """Return top-k chunks by similarity for a given doc_id."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -101,14 +159,13 @@ def search_chunks(
         )
         rows = cur.fetchall()
 
-    results: List[Tuple[str, dict, float]] = []
+    results = []
     for content, metadata, score in rows:
         results.append((content, metadata, float(score)))
     return results
 
 
 def synthesize_answer(question: str, chunks: List[Tuple[str, dict, float]]) -> str:
-    """Use the chat model to synthesize an answer from retrieved chunks."""
     if not chunks:
         return "I couldn't find any relevant content in the book for that question."
 
@@ -126,17 +183,15 @@ def synthesize_answer(question: str, chunks: List[Tuple[str, dict, float]]) -> s
             {
                 "role": "system",
                 "content": (
-                    "You are a helpful assistant that answers questions ONLY "
-                    "about the ingested books (starting with 'Fundamentals of Data Engineering'). "
-                    "Base your answers strictly on the provided context; if the "
-                    "answer is not in the context, say you don't know."
+                    "You are a helpful assistant that answers questions ONLY about the ingested books. "
+                    "Base answers strictly on the provided context; if not present, say you don't know."
                 ),
             },
             {
                 "role": "user",
                 "content": (
                     f"Question:\n{question}\n\n"
-                    f"Context from the book (multiple chunks):\n\n{context_text}"
+                    f"Context from the book:\n\n{context_text}"
                 ),
             },
         ],
@@ -146,12 +201,14 @@ def synthesize_answer(question: str, chunks: List[Tuple[str, dict, float]]) -> s
     return completion.choices[0].message.content.strip()
 
 
-# ---------- FastAPI models & app ----------
-
+# -------------------------------------------------------------------
+# FastAPI Models
+# -------------------------------------------------------------------
 class ChatRequest(BaseModel):
     question: str
     source_name: Optional[str] = "Fundamentals of Data Engineering"
     top_k: int = 5
+    session_id: Optional[str] = None  # NEW
 
 
 class ChunkInfo(BaseModel):
@@ -163,16 +220,41 @@ class ChunkInfo(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     chunks: List[ChunkInfo]
+    session_id: str  # NEW
+
+class SessionSummaryModel(BaseModel):
+    session_id: str
+    started_at: str
+    title: Optional[str] = None
 
 
+class HistoryMessageModel(BaseModel):
+    role: str
+    content: str
+    created_at: Optional[str] = None
+
+
+# -------------------------------------------------------------------
+# FastAPI App + Endpoint
+# -------------------------------------------------------------------
 app = FastAPI(title="webui_v3 RAG API")
 
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    """Chat endpoint: ask a question about a given book/source."""
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question must not be empty.")
+
+    # Create or reuse session
+    session_id = req.session_id or create_session()
+
+    # Store user question immediately
+    insert_message(
+        session_id=session_id,
+        role="user",
+        content=req.question,
+        model_name=None,
+    )
 
     conn = get_pg_connection()
     try:
@@ -182,13 +264,92 @@ def chat(req: ChatRequest):
 
         answer = synthesize_answer(req.question, rows)
 
-        chunk_infos: List[ChunkInfo] = []
-        for content, metadata, score in rows:
-            idx = int(metadata.get("chunk_idx", -1))
-            chunk_infos.append(
-                ChunkInfo(content=content, score=score, chunk_idx=idx)
-            )
+        # Store assistant answer
+        insert_message(
+            session_id=session_id,
+            role="assistant",
+            content=answer,
+            model_name=OLLAMA_CHAT_MODEL,
+            metadata={"chunks": rows},
+        )
 
-        return ChatResponse(answer=answer, chunks=chunk_infos)
+        chunk_infos = [
+            ChunkInfo(
+                content=content,
+                score=score,
+                chunk_idx=int(metadata.get("chunk_idx", -1)),
+            )
+            for content, metadata, score in rows
+        ]
+
+        return ChatResponse(
+            answer=answer,
+            chunks=chunk_infos,
+            session_id=session_id,
+        )
+
+    finally:
+        conn.close()
+@app.get("/api/sessions", response_model=List[SessionSummaryModel])
+def list_sessions(limit: int = 20):
+    """
+    Return recent chat sessions for the history sidebar.
+    """
+    conn = get_pg_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT session_id, started_at, title
+            FROM chat_history.sessions
+            ORDER BY started_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+
+        return [
+            SessionSummaryModel(
+                session_id=str(session_id),
+                started_at=started_at.isoformat(),
+                title=title,
+            )
+            for (session_id, started_at, title) in rows
+        ]
+    finally:
+        conn.close()
+
+
+@app.get(
+    "/api/sessions/{session_id}/messages",
+    response_model=List[HistoryMessageModel],
+)
+def get_session_messages(session_id: str):
+    """
+    Return all messages for a given session, oldest first.
+    """
+    conn = get_pg_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT role, content, created_at
+            FROM chat_history.messages
+            WHERE session_id = %s
+            ORDER BY created_at ASC
+            """,
+            (session_id,),
+        )
+        rows = cur.fetchall()
+
+        return [
+            HistoryMessageModel(
+                role=role,
+                content=content,
+                created_at=created_at.isoformat() if created_at else None,
+            )
+            for (role, content, created_at) in rows
+        ]
     finally:
         conn.close()
