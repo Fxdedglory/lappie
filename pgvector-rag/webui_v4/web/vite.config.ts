@@ -1,8 +1,5 @@
-// vite.config.ts
-// echo: vite.config.ts v0.1.0 2025-11-17
-
 import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
+import react from '@vitejs/plugin-react-swc'
 
 // https://vite.dev/config/
 export default defineConfig({

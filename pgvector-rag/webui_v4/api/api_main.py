@@ -2,12 +2,14 @@
 api_main.py
 FastAPI wrapper around your existing RAG setup + chat history.
 
-Version: v0.2.0 (2025-11-17)
-echo: api_main.py v0.2.0 2025-11-17
+Version: v0.3.0 (2025-11-17)
+echo: api_main.py v0.3.0 2025-11-17
 """
 
 import os
-from typing import List, Optional, Tuple
+import math
+import uuid
+from typing import List, Optional, Tuple, Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -16,7 +18,7 @@ from openai import OpenAI
 
 import psycopg2
 from psycopg2.extras import Json
-import uuid
+
 
 # -------------------------------------------------------------------
 # Load .env from this directory
@@ -38,6 +40,7 @@ OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "gemma3:4b")
 
 client = OpenAI(base_url=OLLAMA_BASE_URL, api_key=OLLAMA_API_KEY)
 
+
 # -------------------------------------------------------------------
 # Postgres connection
 # -------------------------------------------------------------------
@@ -49,6 +52,7 @@ def get_pg_connection():
         user=os.getenv("PGUSER", "postgres"),
         password=os.getenv("PGPASSWORD", "postgres"),
     )
+
 
 # -------------------------------------------------------------------
 # Chat History Helpers
@@ -105,6 +109,7 @@ def insert_message(
     cur.close()
     conn.close()
 
+
 # -------------------------------------------------------------------
 # RAG Functions
 # -------------------------------------------------------------------
@@ -128,12 +133,27 @@ def get_latest_doc_id(conn, source_name: str) -> str:
         return str(row[0])
 
 
-def embed_question(question: str) -> str:
+def get_embedding_vector(text: str) -> list[float]:
+    """
+    Return the raw embedding vector (list of floats) for a given text.
+
+    This is used both for:
+    - pgvector searches (via embed_question)
+    - debugging / embedding browser tools
+    """
     resp = client.embeddings.create(
         model=OLLAMA_EMBED_MODEL,
-        input=question,
+        input=text,
     )
-    emb = resp.data[0].embedding
+    return list(resp.data[0].embedding)
+
+
+def embed_question(question: str) -> str:
+    """
+    Return a pgvector literal string for the question embedding,
+    e.g. '[0.123456,0.234567,...]'.
+    """
+    emb = get_embedding_vector(question)
     return "[" + ",".join(f"{x:.6f}" for x in emb) + "]"
 
 
@@ -159,7 +179,7 @@ def search_chunks(
         )
         rows = cur.fetchall()
 
-    results = []
+    results: List[Tuple[str, dict, float]] = []
     for content, metadata, score in rows:
         results.append((content, metadata, float(score)))
     return results
@@ -201,6 +221,95 @@ def synthesize_answer(question: str, chunks: List[Tuple[str, dict, float]]) -> s
     return completion.choices[0].message.content.strip()
 
 
+def rerank_chunks_with_llm(
+    question: str,
+    chunks: List[Tuple[str, dict, float]],
+) -> List[Tuple[str, dict, float, float]]:
+    """
+    Given (content, metadata, base_score) from vector search,
+    call the chat model once to assign rerank scores in [0, 1].
+
+    Returns a list of (content, metadata, base_score, rerank_score),
+    sorted by rerank_score descending.
+    """
+    if not chunks:
+        return []
+
+    # Build a compact preview to avoid huge prompts
+    lines = []
+    for i, (content, metadata, base_score) in enumerate(chunks, start=1):
+        preview = content.replace("\n", " ")
+        if len(preview) > 400:
+            preview = preview[:400] + "..."
+        lines.append(
+            f"Chunk {i} (base_score={base_score:.3f}, "
+            f"chunk_idx={metadata.get('chunk_idx', -1)}): {preview}"
+        )
+
+    context = "\n".join(lines)
+
+    system_msg = (
+        "You are a reranking helper. Given a question and a list of text chunks, "
+        "assign a relevance score between 0.0 and 1.0 to EACH chunk.\n"
+        "Higher score = more relevant to the question.\n"
+        "Return your answer as one line per chunk in the exact format:\n"
+        "index score\n"
+        "For example, if there are 3 chunks, you might return:\n"
+        "1 0.92\n"
+        "2 0.15\n"
+        "3 0.40\n"
+        "Do not include any other text."
+    )
+
+    user_msg = (
+        f"Question:\n{question}\n\n"
+        f"Chunks:\n{context}\n\n"
+        "Now return the scores."
+    )
+
+    completion = client.chat.completions.create(
+        model=OLLAMA_CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.0,
+    )
+
+    text = completion.choices[0].message.content.strip()
+    # Parse lines like "1 0.92"
+    scores_by_index: dict[int, float] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            idx = int(parts[0])
+            score = float(parts[1])
+            scores_by_index[idx] = max(0.0, min(1.0, score))
+        except ValueError:
+            continue
+
+    # Fallback: if parsing failed, just mirror base scores
+    if not scores_by_index:
+        return [
+            (content, metadata, base_score, base_score)
+            for (content, metadata, base_score) in chunks
+        ]
+
+    reranked: List[Tuple[str, dict, float, float]] = []
+    for i, (content, metadata, base_score) in enumerate(chunks, start=1):
+        rerank_score = scores_by_index.get(i, base_score)
+        reranked.append((content, metadata, base_score, rerank_score))
+
+    # Sort by rerank_score desc
+    reranked.sort(key=lambda x: x[3], reverse=True)
+    return reranked
+
+
 # -------------------------------------------------------------------
 # FastAPI Models
 # -------------------------------------------------------------------
@@ -222,6 +331,7 @@ class ChatResponse(BaseModel):
     chunks: List[ChunkInfo]
     session_id: str  # NEW
 
+
 class SessionSummaryModel(BaseModel):
     session_id: str
     started_at: str
@@ -234,8 +344,58 @@ class HistoryMessageModel(BaseModel):
     created_at: Optional[str] = None
 
 
+# ---------- Tooling: SQL helper models ----------
+class SqlRequest(BaseModel):
+    query: str
+
+
+class SqlResponse(BaseModel):
+    # Now rows are dicts keyed by column name, so the frontend can do row[col]
+    rows: list[dict[str, Any]]
+    columns: list[str]
+
+
+class ChunkViewRequest(BaseModel):
+    question: str
+    source_name: Optional[str] = "Fundamentals of Data Engineering"
+    top_k: int = 5
+
+
+class ChunkViewResponse(BaseModel):
+    chunks: List[ChunkInfo]
+
+
+# ---------- Reranker debug models ----------
+class RerankChunksRequest(BaseModel):
+    question: str
+    source_name: Optional[str] = "Fundamentals of Data Engineering"
+    top_k: int = 5
+
+
+class RerankChunk(BaseModel):
+    content: str
+    base_score: float
+    rerank_score: float
+    chunk_idx: int
+
+
+class RerankChunksResponse(BaseModel):
+    chunks: List[RerankChunk]
+
+
+# ---------- Embedding debug models ----------
+class EmbeddingToolRequest(BaseModel):
+    text: str
+
+
+class EmbeddingToolResponse(BaseModel):
+    dimension: int
+    norm: float
+    vector: list[float]
+
+
 # -------------------------------------------------------------------
-# FastAPI App + Endpoint
+# FastAPI App + Endpoints
 # -------------------------------------------------------------------
 app = FastAPI(title="webui_v3 RAG API")
 
@@ -290,6 +450,8 @@ def chat(req: ChatRequest):
 
     finally:
         conn.close()
+
+
 @app.get("/api/sessions", response_model=List[SessionSummaryModel])
 def list_sessions(limit: int = 20):
     """
@@ -353,3 +515,137 @@ def get_session_messages(session_id: str):
         ]
     finally:
         conn.close()
+
+
+@app.post("/api/tools/sql", response_model=SqlResponse)
+def run_sql_tool(req: SqlRequest):
+    """
+    Very simple, read-only SQL helper.
+
+    - Only allows queries starting with SELECT (case-insensitive).
+    - No semicolons allowed (single statement only).
+    - Runs against chat_ingest via get_pg_connection().
+    """
+    q = req.query.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Query must not be empty.")
+
+    # Basic safety checks
+    if ";" in q:
+        raise HTTPException(
+            status_code=400,
+            detail="Multiple statements / semicolons are not allowed.",
+        )
+
+    if not q.lower().startswith("select"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only SELECT queries are allowed in this endpoint.",
+        )
+
+    conn = get_pg_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(q)
+            rows = cur.fetchall()
+            columns = [desc[0] for desc in cur.description] if cur.description else []
+    finally:
+        conn.close()
+
+    # Convert rows (tuples) into dicts keyed by column name
+    list_rows: list[dict[str, Any]] = []
+    for row in rows:
+        obj: dict[str, Any] = {}
+        for col_name, value in zip(columns, row):
+            obj[col_name] = value
+        list_rows.append(obj)
+
+    return SqlResponse(rows=list_rows, columns=columns)
+
+
+@app.post("/api/tools/chunks", response_model=ChunkViewResponse)
+def view_chunks(req: ChunkViewRequest):
+    """
+    Debug endpoint: return the raw top-k chunks for a question,
+    without LLM synthesis. Useful for checking retrieval quality.
+    """
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question must not be empty.")
+
+    conn = get_pg_connection()
+    try:
+        doc_id = get_latest_doc_id(conn, req.source_name)
+        q_vec = embed_question(req.question)
+        rows = search_chunks(conn, doc_id, q_vec, top_k=req.top_k)
+
+        chunk_infos: List[ChunkInfo] = []
+        for content, metadata, score in rows:
+            idx = int(metadata.get("chunk_idx", -1))
+            chunk_infos.append(
+                ChunkInfo(
+                    content=content,
+                    score=score,
+                    chunk_idx=idx,
+                )
+            )
+
+        return ChunkViewResponse(chunks=chunk_infos)
+    finally:
+        conn.close()
+
+
+@app.post("/api/tools/chunks_rerank", response_model=RerankChunksResponse)
+def debug_chunks_rerank(req: RerankChunksRequest):
+    """
+    Debug endpoint: run vector search, then rerank chunks with the LLM.
+    Returns both base_score (vector similarity) and rerank_score.
+    """
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question must not be empty.")
+
+    conn = get_pg_connection()
+    try:
+        doc_id = get_latest_doc_id(conn, req.source_name)
+        q_vec = embed_question(req.question)
+        base_rows = search_chunks(conn, doc_id, q_vec, top_k=req.top_k)
+    finally:
+        conn.close()
+
+    if not base_rows:
+        return RerankChunksResponse(chunks=[])
+
+    reranked = rerank_chunks_with_llm(req.question, base_rows)
+
+    payload: List[RerankChunk] = []
+    for content, metadata, base_score, rerank_score in reranked:
+        idx = int(metadata.get("chunk_idx", -1))
+        payload.append(
+            RerankChunk(
+                content=content,
+                base_score=base_score,
+                rerank_score=rerank_score,
+                chunk_idx=idx,
+            )
+        )
+
+    return RerankChunksResponse(chunks=payload)
+
+
+@app.post("/api/tools/embedding", response_model=EmbeddingToolResponse)
+def run_embedding_tool(req: EmbeddingToolRequest):
+    """
+    Debug endpoint: return the raw embedding vector for a given text,
+    along with its dimension and L2 norm.
+    """
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text must not be empty.")
+
+    vec = get_embedding_vector(text)
+    norm = math.sqrt(sum(x * x for x in vec))
+
+    return EmbeddingToolResponse(
+        dimension=len(vec),
+        norm=norm,
+        vector=vec,
+    )
