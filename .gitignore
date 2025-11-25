@@ -1,0 +1,31 @@
+# echo: gitignore v0.1.0 2025-11-25
+
+# Python / backend
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+.env.*
+
+# Node / frontend
+node_modules/
+dist/
+.build/
+.cache/
+
+# IDE/editor
+.vscode/
+.idea/
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Data / scratch
+*.sqlite
+*.db
+*.log

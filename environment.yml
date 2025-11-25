@@ -1,0 +1,15 @@
+name: pgvectorscale-rag
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - psycopg2
+  - python-dotenv
+  - pydantic>=2.0
+  - pandas
+  - numpy
+  - pypdf
+  - tqdm
+  - requests
